@@ -1,0 +1,7 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+
+# Machine-local Claude Code permission grants (absolute paths, not portable).
+.claude/settings.local.json
