@@ -6,7 +6,7 @@ the rolling last 7 and 30 days, and for the calendar month to date.
 
 ## Setup
 
-Already done in this directory, but to recreate from scratch:
+Create from scratch:
 
 ```powershell
 py -3.14 -m venv .venv
@@ -26,9 +26,9 @@ Edit `.env` (see `.env.example` for the full annotated list):
 | `KASA_HOSTS` | Optional comma-separated IPs to poll directly, skipping broadcast. |
 | `KASA_OUTPUT_FORMAT` | `table` or `json`. |
 
-> This machine has several NICs (Wi-Fi `192.168.1.0/24`, wired `10.0.0.0/24`,
-> WSL, Tailscale). The default `255.255.255.255` broadcast leaves via the wrong
-> interface and finds nothing, which is why the target is pinned to
+> If the machine has several NICs (Wi-Fi `192.168.1.0/24`, wired `10.0.0.0/24`,
+> WSL, Tailscale). The default `255.255.255.255` broadcast may leave via the wrong
+> interface and find nothing, so the discovery target can be set such as
 > `10.0.0.255`.
 
 ## Usage
