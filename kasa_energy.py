@@ -9,6 +9,7 @@ Usage:
     python kasa_energy.py
     python kasa_energy.py --format json
     python kasa_energy.py --host 192.168.1.50
+    python kasa_energy.py --sendemail
 """
 
 from __future__ import annotations
@@ -17,9 +18,12 @@ import argparse
 import asyncio
 import json
 import os
+import smtplib
 import sys
 from dataclasses import asdict, dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from email.message import EmailMessage
+from html import escape
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -76,16 +80,67 @@ class Config:
         return None
 
 
+@dataclass
+class SmtpConfig:
+    """Office 365 (or any STARTTLS) mail settings, read from the same .env."""
+
+    server: str
+    port: int
+    sender: str
+    password: str
+    recipients: list[str]
+
+
+def env_int(name: str, default: str) -> int:
+    raw = os.getenv(name, default).strip() or default
+    try:
+        return int(raw)
+    except ValueError:
+        sys.exit(f"{name} must be an integer, got {raw!r}")
+
+
+def load_smtp() -> SmtpConfig:
+    """Read the mail settings, exiting if any required one is missing.
+
+    Called before the poll so a misconfigured mailbox fails in a moment rather
+    than after the several seconds discovery takes.
+    """
+    server = os.getenv("SMTP_SERVER", "").strip()
+    sender = os.getenv("SENDER_EMAIL", "").strip()
+    # Google shows app passwords as four space-separated groups; the spaces are
+    # display only and must not reach the AUTH command.
+    password = os.getenv("APP_PASSWORD", "").replace(" ", "").strip()
+    # One address or several, comma-separated.
+    recipients = [a.strip() for a in os.getenv("RECEIVER_EMAIL", "").split(",") if a.strip()]
+
+    missing = [
+        name
+        for name, value in (
+            ("SMTP_SERVER", server),
+            ("SENDER_EMAIL", sender),
+            ("APP_PASSWORD", password),
+            ("RECEIVER_EMAIL", recipients),
+        )
+        if not value
+    ]
+    if missing:
+        sys.exit(f"--sendemail needs these set in .env: {', '.join(missing)}")
+
+    return SmtpConfig(
+        server=server,
+        port=env_int("SMTP_PORT", "587"),
+        sender=sender,
+        password=password,
+        recipients=recipients,
+    )
+
+
 def load_config() -> Config:
     # Anchor to the script's own directory so the .env is found no matter
     # which working directory the script is invoked from.
     load_dotenv(Path(__file__).resolve().parent / ".env")
 
-    raw_timeout = os.getenv("KASA_DISCOVERY_TIMEOUT", "5").strip() or "5"
-    try:
-        timeout = int(raw_timeout)
-    except ValueError:
-        sys.exit(f"KASA_DISCOVERY_TIMEOUT must be an integer, got {raw_timeout!r}")
+    timeout = env_int("KASA_DISCOVERY_TIMEOUT", "5")
 
     hosts = [h.strip() for h in os.getenv("KASA_HOSTS", "").split(",") if h.strip()]
 
@@ -302,6 +357,11 @@ def is_suspect(r: Reading) -> bool:
     return r.watts > 10 and r.watts > implied * 3 + 10
 
 
+def site_watts(leaves: list[Reading]) -> float:
+    """Total live draw, skipping the rows whose meter contradicts itself."""
+    return sum(r.watts for r in leaves if r.watts is not None and not is_suspect(r))
+
+
 def print_table(readings: list[Reading]) -> None:
     headers = [
         "DEVICE",
@@ -375,6 +435,360 @@ def print_table(readings: list[Reading]) -> None:
             print(f"error: {r.alias} ({r.host}): {r.error}", file=sys.stderr)
 
 
+# --- Email -----------------------------------------------------------------
+#
+# Everything below builds the --sendemail message. The console path above is
+# untouched: this renders the same readings independently, as HTML.
+#
+# Mail clients are a hostile rendering target - Outlook draws with Word, which
+# has no flexbox, no grid and no CSS variables, and remote images are blocked by
+# default. So the charts are built the only way that survives: nested tables,
+# inline styles, and bar widths as percentages. Nothing is fetched at open time.
+
+# Palette from the dataviz skill's reference instance, checked with its
+# validator against the #fcfcfb surface (lightness, chroma, CVD separation and
+# contrast all pass). Bars are a single series, so every bar wears the same
+# blue - shading them by value would double-encode the length. Red is the
+# reserved "critical" status step, used only to mark an impossible reading.
+SURFACE = "#fcfcfb"
+PAGE = "#f9f9f7"
+INK = "#0b0b0b"
+INK_SOFT = "#52514e"
+INK_MUTED = "#898781"
+HAIRLINE = "#e1e0d9"
+TRACK = "#f0efec"
+SERIES = "#2a78d6"
+CRITICAL = "#d03b3b"
+FONT = "-apple-system,'Segoe UI',system-ui,Roboto,Helvetica,Arial,sans-serif"
+
+BAR_H = 14  # Bar thickness, px. The spec caps marks at 24px - thin reads calm.
+
+
+def esc(value: object) -> str:
+    return escape(str(value), quote=True)
+
+
+def chart_rows(leaves: list[Reading], attr: str, skip_suspect: bool) -> list[tuple[str, float]]:
+    """Pull one metric into (label, value) pairs, largest first."""
+    rows = [
+        (r.alias, value)
+        for r in leaves
+        if (value := getattr(r, attr)) is not None and not (skip_suspect and is_suspect(r))
+    ]
+    return sorted(rows, key=lambda row: row[1], reverse=True)
+
+
+def html_bar(pct: float) -> str:
+    """One horizontal bar: filled cell + track, drawn as a 2-cell table.
+
+    Percentage widths are the only sizing an email client reliably honours, and
+    a table cell is the only element it reliably paints a background on.
+    """
+    cells = ""
+    if pct > 0:
+        # Rounded at the data end, square at the baseline it grows from.
+        cells += (
+            f'<td width="{pct:.2f}%" height="{BAR_H}" style="width:{pct:.2f}%;'
+            f"background-color:{SERIES};border-radius:0 4px 4px 0;font-size:1px;"
+            f'line-height:{BAR_H}px;">&nbsp;</td>'
+        )
+    if pct < 100:
+        cells += (
+            f'<td height="{BAR_H}" style="background-color:{TRACK};font-size:1px;'
+            f'line-height:{BAR_H}px;">&nbsp;</td>'
+        )
+    return (
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+        f"<tr>{cells}</tr></table>"
+    )
+
+
+def html_chart(title: str, note: str, rows: list[tuple[str, float]], unit: str, places: int) -> str:
+    """A labelled horizontal bar chart. Returns "" when there is nothing to plot."""
+    if not rows:
+        return ""
+
+    peak = max(value for _, value in rows)
+    body = []
+    for label, value in rows:
+        # A tiny non-zero value still gets a sliver, so "on but idle" is
+        # visibly different from "off".
+        pct = 0.0 if peak <= 0 else max(value / peak * 100, 0.8 if value > 0 else 0.0)
+        body.append(
+            "<tr>"
+            f'<td style="width:34%;padding:3px 12px 3px 0;font-family:{FONT};font-size:12px;'
+            f'color:{INK_SOFT};">{esc(label)}</td>'
+            f'<td style="padding:3px 0;">{html_bar(pct)}</td>'
+            f'<td style="width:78px;padding:3px 0 3px 10px;text-align:right;font-family:{FONT};'
+            f"font-size:12px;font-weight:600;color:{INK};font-variant-numeric:tabular-nums;"
+            f'white-space:nowrap;">{value:.{places}f} {esc(unit)}</td>'
+            "</tr>"
+        )
+
+    return (
+        f'<tr><td style="padding:22px 24px 0 24px;">'
+        f'<div style="font-family:{FONT};font-size:14px;font-weight:600;color:{INK};">'
+        f"{esc(title)}</div>"
+        f'<div style="font-family:{FONT};font-size:12px;color:{INK_MUTED};padding-top:2px;">'
+        f"{esc(note)}</div>"
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+        f'style="padding-top:10px;">{"".join(body)}</table>'
+        "</td></tr>"
+    )
+
+
+def html_tile(label: str, value: str, unit: str) -> str:
+    return (
+        f'<td width="25%" style="width:25%;padding:12px 14px;background-color:#ffffff;'
+        f'border:1px solid {HAIRLINE};">'
+        f'<div style="font-family:{FONT};font-size:11px;color:{INK_MUTED};'
+        f'text-transform:uppercase;letter-spacing:0.04em;">{esc(label)}</div>'
+        f'<div style="font-family:{FONT};font-size:20px;font-weight:600;color:{INK};'
+        f'padding-top:4px;white-space:nowrap;">{esc(value)}'
+        f'<span style="font-size:12px;font-weight:400;color:{INK_SOFT};"> {esc(unit)}</span>'
+        "</div></td>"
+    )
+
+
+def html_device_table(readings: list[Reading]) -> str:
+    """The table view - every value in the charts is also readable here."""
+    headers = ["Device", "IP", "Model", "State", "Volts", "Watts", "Amps", "Today", "7d", "30d", "MTD"]
+    head = "".join(
+        f'<th align="{"left" if i < 4 else "right"}" style="padding:6px 8px;font-family:{FONT};'
+        f"font-size:11px;font-weight:600;color:{INK_MUTED};text-transform:uppercase;"
+        f'letter-spacing:0.04em;border-bottom:1px solid {HAIRLINE};">{esc(h)}</th>'
+        for i, h in enumerate(headers)
+    )
+
+    body = []
+    for r in readings:
+        if r.error:
+            state = f'<span style="color:{CRITICAL};font-weight:600;">ERROR</span>'
+        else:
+            state = "On" if r.is_on else f'<span style="color:{INK_MUTED};">Off</span>'
+        watts = fmt(r.watts, 1)
+        if is_suspect(r):
+            watts = f'<span style="color:{CRITICAL};">{watts} !</span>'
+
+        cells = [
+            esc(r.alias) + (" *" if r.is_aggregate else ""),
+            esc(r.host),
+            esc(r.model),
+            state,
+            fmt(r.volts, 1),
+            watts,
+            fmt(r.amps, 3),
+            fmt(r.kwh_today, 3),
+            fmt(r.kwh_week, 3),
+            fmt(r.kwh_last_30d, 3),
+            fmt(r.kwh_month_to_date, 3),
+        ]
+        body.append(
+            "<tr>"
+            + "".join(
+                f'<td align="{"left" if i < 4 else "right"}" style="padding:6px 8px;'
+                f"font-family:{FONT};font-size:12px;color:{INK_SOFT};"
+                f"font-variant-numeric:tabular-nums;border-bottom:1px solid {HAIRLINE};"
+                # Only the device name is allowed to wrap; a split number reads
+                # as two numbers.
+                f'{"" if i == 0 else "white-space:nowrap;"}">{cell}</td>'
+                for i, cell in enumerate(cells)
+            )
+            + "</tr>"
+        )
+
+    return (
+        f'<tr><td style="padding:22px 24px 0 24px;">'
+        f'<div style="font-family:{FONT};font-size:14px;font-weight:600;color:{INK};'
+        f'padding-bottom:8px;">All devices</div>'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+        f"<tr>{head}</tr>{''.join(body)}</table></td></tr>"
+    )
+
+
+def summary_notes(readings: list[Reading], leaves: list[Reading]) -> list[str]:
+    """The same caveats the console footer carries, as plain sentences."""
+    notes = []
+    if any(r.is_aggregate for r in readings):
+        notes.append(
+            "* Strip totals are shown but excluded from the sums, since their outlets "
+            "are already counted."
+        )
+    for r in readings:
+        if is_suspect(r):
+            notes.append(
+                f"! {r.alias} reported {r.watts:.1f} W against {r.volts:.1f} V x "
+                f"{r.amps:.3f} A, which is impossible - left out of the charts and totals."
+            )
+    no_history = [r for r in leaves if r.has_energy_meter and r.kwh_week is None]
+    if no_history:
+        names = ", ".join(r.alias for r in no_history)
+        notes.append(
+            f"{len(no_history)} metered device(s) keep no per-day history, so they add "
+            f"nothing to the 7- and 30-day figures: {names}."
+        )
+    for r in readings:
+        if r.error:
+            notes.append(f"{r.alias} ({r.host}) did not respond: {r.error}")
+    return notes
+
+
+def render_summary_html(readings: list[Reading], when: datetime) -> str:
+    leaves = [r for r in readings if not r.is_aggregate]
+    metered = sum(1 for r in leaves if r.has_energy_meter)
+    watts_now = site_watts(leaves)
+
+    tiles = "".join(
+        html_tile(label, f"{leaf_total(leaves, attr):.3f}", "kWh")
+        for label, attr in (
+            ("Today", "kwh_today"),
+            (f"Last {WEEK_DAYS} days", "kwh_week"),
+            (f"Last {ROLLING_DAYS} days", "kwh_last_30d"),
+            ("Month to date", "kwh_month_to_date"),
+        )
+    )
+
+    charts = (
+        html_chart(
+            "Live draw by device",
+            "Watts at the moment of the poll.",
+            chart_rows(leaves, "watts", skip_suspect=True),
+            "W",
+            1,
+        )
+        + html_chart(
+            "Energy today by device",
+            "kWh since midnight.",
+            chart_rows(leaves, "kwh_today", skip_suspect=False),
+            "kWh",
+            3,
+        )
+        + html_chart(
+            f"Last {ROLLING_DAYS} days by device",
+            f"kWh over the rolling {ROLLING_DAYS}-day window, for the devices that keep a "
+            "per-day history.",
+            chart_rows(leaves, "kwh_last_30d", skip_suspect=False),
+            "kWh",
+            3,
+        )
+    )
+
+    notes = summary_notes(readings, leaves)
+    notes_html = ""
+    if notes:
+        notes_html = (
+            f'<tr><td style="padding:22px 24px 0 24px;">'
+            + "".join(
+                f'<div style="font-family:{FONT};font-size:12px;color:{INK_MUTED};'
+                f'padding-top:4px;">{esc(n)}</div>'
+                for n in notes
+            )
+            + "</td></tr>"
+        )
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+</head>
+<body style="margin:0;padding:0;background-color:{PAGE};">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+       style="background-color:{PAGE};padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="760" cellpadding="0" cellspacing="0" border="0"
+       style="width:760px;max-width:100%;background-color:{SURFACE};border:1px solid {HAIRLINE};">
+
+  <tr><td style="padding:24px 24px 0 24px;">
+    <div style="font-family:{FONT};font-size:16px;font-weight:600;color:{INK};">
+      Kasa energy summary</div>
+    <div style="font-family:{FONT};font-size:12px;color:{INK_MUTED};padding-top:2px;">
+      {esc(when.strftime('%A %d %B %Y, %H:%M'))}</div>
+  </td></tr>
+
+  <tr><td style="padding:18px 24px 0 24px;">
+    <div style="font-family:{FONT};font-size:48px;font-weight:600;color:{INK};line-height:1.1;">
+      {watts_now:.1f}<span style="font-size:20px;font-weight:400;color:{INK_SOFT};"> W</span></div>
+    <div style="font-family:{FONT};font-size:12px;color:{INK_MUTED};padding-top:2px;">
+      drawn now across {len(leaves)} device(s), {metered} of them metered</div>
+  </td></tr>
+
+  <tr><td style="padding:18px 24px 0 24px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="4" border="0">
+      <tr>{tiles}</tr>
+    </table>
+  </td></tr>
+
+  {charts}
+  {html_device_table(readings)}
+  {notes_html}
+
+  <tr><td style="padding:20px 24px 24px 24px;">
+    <div style="font-family:{FONT};font-size:11px;color:{INK_MUTED};
+                border-top:1px solid {HAIRLINE};padding-top:12px;">
+      Sent by kasa_energy.py --sendemail</div>
+  </td></tr>
+
+</table>
+</td></tr></table>
+</body></html>"""
+
+
+def render_summary_text(readings: list[Reading], when: datetime) -> str:
+    """Plain-text alternative, for clients that will not render the HTML part."""
+    leaves = [r for r in readings if not r.is_aggregate]
+    lines = [
+        f"Kasa energy summary - {when:%Y-%m-%d %H:%M}",
+        "",
+        f"{site_watts(leaves):.1f} W drawn now across {len(leaves)} device(s).",
+        f"kWh: {leaf_total(leaves, 'kwh_today'):.3f} today, "
+        f"{leaf_total(leaves, 'kwh_week'):.3f} last {WEEK_DAYS} days, "
+        f"{leaf_total(leaves, 'kwh_last_30d'):.3f} last {ROLLING_DAYS} days, "
+        f"{leaf_total(leaves, 'kwh_month_to_date'):.3f} month to date.",
+        "",
+    ]
+    for r in readings:
+        state = "ERROR" if r.error else ("ON " if r.is_on else "OFF")
+        lines.append(
+            f"  {state}  {r.alias}{' *' if r.is_aggregate else ''}: "
+            f"{fmt(r.watts, 1)} W, {fmt(r.kwh_today, 3)} kWh today, "
+            f"{fmt(r.kwh_last_30d, 3)} kWh last {ROLLING_DAYS} days"
+        )
+    notes = summary_notes(readings, leaves)
+    if notes:
+        lines.append("")
+        lines += notes
+    return "\n".join(lines)
+
+
+def send_email(smtp: SmtpConfig, readings: list[Reading], when: datetime) -> None:
+    leaves = [r for r in readings if not r.is_aggregate]
+
+    msg = EmailMessage()
+    msg["Subject"] = (
+        f"Kasa energy: {site_watts(leaves):.1f} W now, "
+        f"{leaf_total(leaves, 'kwh_today'):.3f} kWh today - {when:%Y-%m-%d %H:%M}"
+    )
+    # Office 365 rejects a From that is not the mailbox that authenticated.
+    msg["From"] = smtp.sender
+    msg["To"] = ", ".join(smtp.recipients)
+    msg.set_content(render_summary_text(readings, when))
+    msg.add_alternative(render_summary_html(readings, when), subtype="html")
+
+    # smtplib greets with the local hostname, and a bare Windows machine name
+    # ("JamesDesktop") is not a domain, which Office 365 rejects outright:
+    #   501 5.5.4 Invalid domain name
+    # The sender's own domain is a valid FQDN and is what the session
+    # authenticates as anyway, so greet with that.
+    _, _, domain = smtp.sender.rpartition("@")
+    with smtplib.SMTP(
+        smtp.server, smtp.port, timeout=30, local_hostname=domain or None
+    ) as server:
+        server.starttls()
+        server.login(smtp.sender, smtp.password)
+        server.send_message(msg)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -391,12 +805,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--format", choices=["table", "json"], help="Override KASA_OUTPUT_FORMAT.")
     parser.add_argument("--timeout", type=int, help="Override KASA_DISCOVERY_TIMEOUT.")
+    parser.add_argument(
+        "--sendemail",
+        action="store_true",
+        help="Also email the summary to RECEIVER_EMAIL. Needs the SMTP settings in .env.",
+    )
     return parser.parse_args()
 
 
 async def main() -> int:
     args = parse_args()
     cfg = load_config()
+    # Read the mail settings up front: a typo in .env should fail now, not
+    # after the poll has spent several seconds talking to the LAN.
+    smtp = load_smtp() if args.sendemail else None
     if args.hosts:
         cfg.hosts = args.hosts
     if args.target:
@@ -425,7 +847,17 @@ async def main() -> int:
     else:
         print_table(readings)
 
-    return 1 if any(r.error for r in readings) else 0
+    failed = any(r.error for r in readings)
+
+    if smtp:
+        try:
+            send_email(smtp, readings, datetime.now())
+        except Exception as exc:  # noqa: BLE001 - any mail failure is worth reporting
+            print(f"error: could not send mail: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(f"emailed summary to {', '.join(smtp.recipients)}")
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

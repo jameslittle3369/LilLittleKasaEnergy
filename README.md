@@ -25,6 +25,9 @@ Edit `.env` (see `.env.example` for the full annotated list):
 | `KASA_DISCOVERY_TIMEOUT` | Seconds to listen for replies. Default `5`; `8` is more reliable here. |
 | `KASA_HOSTS` | Optional comma-separated IPs to poll directly, skipping broadcast. |
 | `KASA_OUTPUT_FORMAT` | `table` or `json`. |
+| `SMTP_SERVER` / `SMTP_PORT` | Mail host for `--sendemail`. Gmail is `smtp.gmail.com` on port `587` (STARTTLS). |
+| `SENDER_EMAIL` / `APP_PASSWORD` | The sending mailbox and its 16-character app password, not the account password. For Gmail, enable 2-Step Verification and generate one at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords); the spaces Google displays are stripped for you. |
+| `RECEIVER_EMAIL` | Who gets the summary. One address, or several comma-separated. |
 
 > If the machine has several NICs (Wi-Fi `192.168.1.0/24`, wired `10.0.0.0/24`,
 > WSL, Tailscale). The default `255.255.255.255` broadcast may leave via the wrong
@@ -38,9 +41,44 @@ Edit `.env` (see `.env.example` for the full annotated list):
 .\.venv\Scripts\python.exe kasa_energy.py --format json
 .\.venv\Scripts\python.exe kasa_energy.py --host 10.0.0.23
 .\.venv\Scripts\python.exe kasa_energy.py --target 192.168.1.255 --timeout 10
+.\.venv\Scripts\python.exe kasa_energy.py --sendemail
 ```
 
 CLI flags override `.env`. Exit code is `1` if any device failed to respond.
+
+## Emailing the summary
+
+`--sendemail` prints the table as usual and then mails the same readings to
+`RECEIVER_EMAIL`. The mail settings are read *before* the poll starts, so a
+missing one fails immediately instead of after discovery:
+
+```
+--sendemail needs these set in .env: SENDER_EMAIL, APP_PASSWORD
+```
+
+The message is sent over STARTTLS and carries two parts: plain text, and an
+HTML version with the numbers charted — a headline figure for live draw, four
+kWh tiles (today / 7d / 30d / month to date), horizontal bar charts for watts,
+kWh today and the 30-day window, then the full device table and the same
+footnotes the console prints. It is built from nested tables with inline styles
+and no images, so it renders in Outlook and Office 365 webmail without
+downloading anything. Devices flagged `!` are left out of the charts — an
+11,437 W bar would flatten every real one — and named in the footnotes instead.
+
+Exit code is `1` if the mail fails to send, with the SMTP error on stderr.
+
+Microsoft mailboxes are not an option for the sender. Both `smtp.office365.com`
+and `smtp-mail.outlook.com` reject an app password with `535 5.7.139
+Authentication unsuccessful, basic authentication is disabled` — on personal
+Hotmail/Outlook.com addresses and tenant mailboxes alike. A tenant admin can
+re-enable it per mailbox (*Authenticated SMTP*); a personal account cannot, and
+would need OAuth2. Gmail is the path of least resistance, which is what the
+example config uses.
+
+One Windows-specific wrinkle is handled in the code: `smtplib` greets the server
+with the local hostname, and a bare machine name like `JamesDesktop` is not a
+domain, which Office 365 rejects outright (`501 5.5.4 Invalid domain name`). The
+greeting uses the sender's own domain instead.
 
 ## Reading the output
 
