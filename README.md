@@ -42,9 +42,12 @@ Edit `.env` (see `.env.example` for the full annotated list):
 .\.venv\Scripts\python.exe kasa_energy.py --host 10.0.0.23
 .\.venv\Scripts\python.exe kasa_energy.py --target 192.168.1.255 --timeout 10
 .\.venv\Scripts\python.exe kasa_energy.py --sendemail
+.\.venv\Scripts\python.exe kasa_energy.py --push-api
 ```
 
 CLI flags override `.env`. Exit code is `1` if any device failed to respond.
+
+`--push-api` POSTs each metered reading to `API_BASE_URL` (sensors-backend-fastapi) and exits -- no table/JSON/email output. This is what the scheduled/automated run uses; the other flags are for manual or separately cron'd use.
 
 ## Emailing the summary
 

@@ -30,6 +30,11 @@ from dotenv import load_dotenv
 from kasa import Credentials, Device, Discover, Module
 from kasa.interfaces.energy import Energy
 
+try:
+    import requests
+except ImportError:  # pragma: no cover - dependency guard
+    requests = None  # only required for --push-api
+
 # Spans of the two rolling windows, in days, counting today as day one.
 WEEK_DAYS = 7
 ROLLING_DAYS = 30
@@ -41,6 +46,10 @@ class Reading:
 
     alias: str
     host: str
+    # Stable across DHCP/IP changes, unlike host -- falls back to host if the
+    # library can't report one (very old firmware). Used as the external_id
+    # when pushing to the API.
+    device_id: str
     model: str
     device_type: str
     is_on: bool | None
@@ -72,6 +81,7 @@ class Config:
     timeout: int
     hosts: list[str] = field(default_factory=list)
     output_format: str = "table"
+    api_base_url: str = ""
 
     @property
     def credentials(self) -> Credentials | None:
@@ -151,6 +161,7 @@ def load_config() -> Config:
         timeout=timeout,
         hosts=hosts,
         output_format=os.getenv("KASA_OUTPUT_FORMAT", "table").strip().lower(),
+        api_base_url=os.getenv("API_BASE_URL", "").strip(),
     )
 
 
@@ -294,6 +305,7 @@ async def to_reading(dev: Device, alias_prefix: str = "") -> Reading:
     reading = Reading(
         alias=f"{alias_prefix}{dev.alias or '(unnamed)'}",
         host=dev.host,
+        device_id=getattr(dev, "device_id", None) or dev.host,
         model=dev.model,
         device_type=dev.device_type.value,
         is_on=dev.is_on,
@@ -312,6 +324,7 @@ async def poll(dev: Device) -> list[Reading]:
             Reading(
                 alias=dev.alias or dev.host,
                 host=dev.host,
+                device_id=getattr(dev, "device_id", None) or dev.host,
                 model=dev.model or "?",
                 device_type="unknown",
                 is_on=None,
@@ -433,6 +446,49 @@ def print_table(readings: list[Reading]) -> None:
     for r in readings:
         if r.error:
             print(f"error: {r.alias} ({r.host}): {r.error}", file=sys.stderr)
+
+
+# --- API push ----------------------------------------------------------
+
+
+def push_readings_to_api(cfg: Config, readings: list[Reading]) -> int:
+    """POST each metered device/outlet's current reading to sensors-backend-fastapi.
+
+    Used for the scheduled/automated run -- skips the table/JSON/email
+    output entirely. Unmetered devices (watts is None) are skipped rather
+    than logging a fabricated zero; strip-aggregate readings are pushed
+    too (as their own circuit) since Grafana may want the whole-strip
+    total as a separate line, unlike the console total which excludes it
+    to avoid double-counting.
+    """
+    if requests is None:
+        sys.exit("--push-api needs the 'requests' package.  Run: pip install -r requirements.txt")
+    if not cfg.api_base_url:
+        sys.exit("--push-api needs API_BASE_URL set in .env")
+
+    base = cfg.api_base_url.rstrip("/")
+    pushed = 0
+    for r in readings:
+        if r.error or r.watts is None:
+            continue
+        url = f"{base}/energy-circuits/kasa/{r.device_id}/log"
+        body = {
+            "name": r.alias,
+            "watts": r.watts,
+            "kwh_today": r.kwh_today,
+            "kwh_7d": r.kwh_week,
+            "kwh_30d": r.kwh_last_30d,
+            "kwh_mtd": r.kwh_month_to_date,
+        }
+        try:
+            response = requests.post(url, json=body, timeout=10)
+            response.raise_for_status()
+            pushed += 1
+        except requests.RequestException as exc:
+            print(f"warning: failed to push {r.alias!r} to API: {exc}", file=sys.stderr)
+
+    print(f"Pushed {pushed}/{len(readings)} reading(s) to {base}.")
+    return 0 if pushed else 1
 
 
 # --- Email -----------------------------------------------------------------
@@ -810,6 +866,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also email the summary to RECEIVER_EMAIL. Needs the SMTP settings in .env.",
     )
+    parser.add_argument(
+        "--push-api",
+        action="store_true",
+        help="POST each metered reading to API_BASE_URL and exit -- no table/JSON/email "
+        "output. This is what the scheduled/automated run uses.",
+    )
     return parser.parse_args()
 
 
@@ -841,6 +903,9 @@ async def main() -> int:
 
     results = await asyncio.gather(*(poll(dev) for dev in devices))
     readings = sorted((r for group in results for r in group), key=lambda r: r.alias.lower())
+
+    if args.push_api:
+        return push_readings_to_api(cfg, readings)
 
     if cfg.output_format == "json":
         print(json.dumps([{**asdict(r), "suspect": is_suspect(r)} for r in readings], indent=2))
