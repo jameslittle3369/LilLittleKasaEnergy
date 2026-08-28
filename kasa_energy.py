@@ -39,6 +39,11 @@ except ImportError:  # pragma: no cover - dependency guard
 WEEK_DAYS = 7
 ROLLING_DAYS = 30
 
+# A residential 15A circuit tops out at 15A x 120V = 1800W. A single outlet
+# reporting more than that (with some headroom for measurement noise) is
+# reporting a corrupt meter register, not real load -- see is_suspect().
+MAX_OUTLET_WATTS = 2000
+
 
 @dataclass
 class Reading:
@@ -57,6 +62,10 @@ class Reading:
     # True for a power-strip parent whose reading is the sum of its outlets.
     # Kept in the table for visibility but excluded from the site-wide total.
     is_aggregate: bool = False
+    # True for a strip parent when one of its children was itself suspect
+    # (is_suspect()): an HS300 parent's watts is a hardware-computed sum of
+    # its outlets, so a bad child reading pollutes the parent's total too.
+    contaminated: bool = False
     volts: float | None = None
     watts: float | None = None
     amps: float | None = None
@@ -345,6 +354,12 @@ async def poll(dev: Device) -> list[Reading]:
     if any(c.has_energy_meter for c in children):
         parent.is_aggregate = True
 
+    # A bad child reading (any is_suspect() reason, not just an outright
+    # >MAX_OUTLET_WATTS one) is already baked into the parent's hardware-
+    # reported sum, so the parent's own total is garbage too.
+    if any(is_suspect(c) for c in children):
+        parent.contaminated = True
+
     return [parent, *children]
 
 
@@ -357,17 +372,49 @@ def leaf_total(leaves: list[Reading], attr: str) -> float:
     return sum(value for r in leaves if (value := getattr(r, attr)) is not None)
 
 
-def is_suspect(r: Reading) -> bool:
-    """True when reported watts contradict volts x amps by a wide margin.
+def exceeds_outlet_max(watts: float | None) -> bool:
+    """True when a single outlet reports more than a 15A circuit can deliver."""
+    return watts is not None and watts > MAX_OUTLET_WATTS
 
-    Some HS300 outlets intermittently return a corrupt power register (e.g.
-    11437 W at 2.6 V / 1.3 A). The raw value is still reported, but counting it
-    in the site total would make the total meaningless.
+
+def suspect_reason(r: Reading) -> str | None:
+    """Human-readable reason a reading is bad data, or None when it's fine.
+
+    Three independent reasons, checked in order:
+    - `contaminated`: a strip parent whose sum includes a child that was
+      itself suspect for any reason below.
+    - A single (non-aggregate) outlet reporting more than MAX_OUTLET_WATTS --
+      physically impossible for one outlet on a 15A circuit.
+    - Reported watts contradict volts x amps by a wide margin. Some HS300
+      outlets intermittently return a corrupt power register (e.g. 11437 W
+      at 2.6 V / 1.3 A).
+
+    Kept as one function (rather than duplicating the checks in is_suspect()
+    and everywhere the reason gets printed) so a caller reporting *why* a
+    reading was excluded can't drift out of sync with what is_suspect()
+    actually excludes -- in particular, it can't assume volts/amps are
+    present, which the first two reasons don't require.
     """
-    if r.volts is None or r.amps is None or r.watts is None:
-        return False
-    implied = r.volts * r.amps
-    return r.watts > 10 and r.watts > implied * 3 + 10
+    if r.contaminated:
+        return f"{r.alias}: excluded because one of its outlets reported over {MAX_OUTLET_WATTS:.0f} W"
+    if exceeds_outlet_max(r.watts) and not r.is_aggregate:
+        return (
+            f"{r.alias} reported {r.watts:.1f} W, more than a 15A circuit can deliver "
+            f"({MAX_OUTLET_WATTS:.0f} W) - treated as a bad reading"
+        )
+    if r.volts is not None and r.amps is not None and r.watts is not None:
+        implied = r.volts * r.amps
+        if r.watts > 10 and r.watts > implied * 3 + 10:
+            return (
+                f"{r.alias} reported {r.watts:.1f} W against {r.volts:.1f} V x "
+                f"{r.amps:.3f} A, which is impossible"
+            )
+    return None
+
+
+def is_suspect(r: Reading) -> bool:
+    """True when the reading is bad data and should be excluded from totals/push."""
+    return suspect_reason(r) is not None
 
 
 def site_watts(leaves: list[Reading]) -> float:
@@ -439,9 +486,9 @@ def print_table(readings: list[Reading]) -> None:
 
     suspect = [r for r in readings if is_suspect(r)]
     if suspect:
-        print("! reported watts contradict volts x amps - excluded from the sum:")
+        print("! bad reading(s), excluded from the sum:")
         for r in suspect:
-            print(f"    {r.alias}: {r.watts:.1f} W vs {r.volts:.1f} V x {r.amps:.3f} A")
+            print(f"    {suspect_reason(r)}")
 
     for r in readings:
         if r.error:
@@ -459,7 +506,9 @@ def push_readings_to_api(cfg: Config, readings: list[Reading]) -> int:
     than logging a fabricated zero; strip-aggregate readings are pushed
     too (as their own circuit) since Grafana may want the whole-strip
     total as a separate line, unlike the console total which excludes it
-    to avoid double-counting.
+    to avoid double-counting. Bad readings (is_suspect()) are skipped
+    entirely, aggregates included -- a contaminated strip total is no
+    more real than the corrupt outlet reading it was summed from.
     """
     if requests is None:
         sys.exit("--push-api needs the 'requests' package.  Run: pip install -r requirements.txt")
@@ -469,7 +518,7 @@ def push_readings_to_api(cfg: Config, readings: list[Reading]) -> int:
     base = cfg.api_base_url.rstrip("/")
     pushed = 0
     for r in readings:
-        if r.error or r.watts is None:
+        if r.error or r.watts is None or is_suspect(r):
             continue
         url = f"{base}/energy-circuits/kasa/{r.device_id}/log"
         body = {
@@ -671,11 +720,8 @@ def summary_notes(readings: list[Reading], leaves: list[Reading]) -> list[str]:
             "are already counted."
         )
     for r in readings:
-        if is_suspect(r):
-            notes.append(
-                f"! {r.alias} reported {r.watts:.1f} W against {r.volts:.1f} V x "
-                f"{r.amps:.3f} A, which is impossible - left out of the charts and totals."
-            )
+        if reason := suspect_reason(r):
+            notes.append(f"! {reason} - left out of the charts and totals.")
     no_history = [r for r in leaves if r.has_energy_meter and r.kwh_week is None]
     if no_history:
         names = ", ".join(r.alias for r in no_history)
